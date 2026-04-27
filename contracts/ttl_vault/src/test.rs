@@ -2777,3 +2777,263 @@ fn test_beneficiary_assigned_event_emitted() {
     
     assert!(has_beneficiary_event);
 }
+
+
+// ---- Issue #401: Beneficiary Delegation Tests ----
+
+#[test]
+fn test_delegate_beneficiary_role() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    // Beneficiary delegates to another address
+    client.delegate_beneficiary_role(&vault_id, &delegate);
+    
+    // Verify delegation
+    let delegated = client.get_delegated_beneficiary(&vault_id);
+    assert_eq!(delegated, Some(delegate.clone()));
+}
+
+#[test]
+fn test_delegate_beneficiary_requires_auth() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    // Non-beneficiary cannot delegate
+    let result = client.try_delegate_beneficiary_role(&vault_id, &delegate);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_delegate_to_self_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    
+    // Cannot delegate to self
+    let result = client.try_delegate_beneficiary_role(&vault_id, &beneficiary);
+    assert!(result.is_err());
+}
+
+
+// ---- Issue #402: Withdrawal Scheduling Tests ----
+
+#[test]
+fn test_set_withdrawal_schedule() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 100i128),
+        (now + 200, 200i128),
+    ];
+    
+    // Owner sets schedule
+    client.set_withdrawal_schedule(&vault_id, &schedule);
+}
+
+#[test]
+fn test_set_withdrawal_schedule_owner_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 100i128),
+    ];
+    
+    // Non-owner cannot set schedule
+    let result = client.try_set_withdrawal_schedule(&vault_id, &schedule);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_scheduled_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1000i128);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 200i128),
+    ];
+    
+    client.set_withdrawal_schedule(&vault_id, &schedule);
+    
+    // Advance time
+    env.ledger().with_mut(|l| l.timestamp = now + 150);
+    
+    // Execute withdrawal
+    client.execute_scheduled_withdrawal(&vault_id);
+    
+    // Verify funds transferred
+    let token_client = token::Client::new(&env, &token_address);
+    assert_eq!(token_client.balance(&beneficiary), 200i128);
+}
+
+#[test]
+fn test_execute_scheduled_withdrawal_with_delegation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let delegate = Address::generate(&env);
+    
+    client.deposit(&vault_id, &owner, &1000i128);
+    client.delegate_beneficiary_role(&vault_id, &delegate);
+    
+    let now = env.ledger().timestamp();
+    let schedule = vec![
+        &env,
+        (now + 100, 200i128),
+    ];
+    
+    client.set_withdrawal_schedule(&vault_id, &schedule);
+    
+    // Advance time
+    env.ledger().with_mut(|l| l.timestamp = now + 150);
+    
+    // Execute withdrawal
+    client.execute_scheduled_withdrawal(&vault_id);
+    
+    // Verify funds transferred to delegate
+    let token_client = token::Client::new(&env, &token_address);
+    assert_eq!(token_client.balance(&delegate), 200i128);
+}
+
+
+// ---- Issue #400: Conditional Acceptance Tests ----
+
+#[test]
+fn test_accept_with_conditions() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Only if owner is deceased");
+    
+    // Beneficiary accepts with conditions
+    client.accept_with_conditions(&vault_id, &conditions);
+    
+    // Verify conditions stored
+    let stored = client.get_conditional_acceptance(&vault_id);
+    assert!(stored.is_some());
+    assert_eq!(stored.unwrap().approved_by_owner, false);
+}
+
+#[test]
+fn test_accept_with_conditions_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Some conditions");
+    
+    // Non-beneficiary cannot accept with conditions
+    let result = client.try_accept_with_conditions(&vault_id, &conditions);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_approve_conditional_acceptance() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let conditions = String::from_str(&env, "Some conditions");
+    
+    client.accept_with_conditions(&vault_id, &conditions);
+    
+    // Owner approves
+    client.approve_conditional_acceptance(&vault_id);
+    
+    // Verify approval
+    let stored = client.get_conditional_acceptance(&vault_id);
+    assert!(stored.is_some());
+    assert_eq!(stored.unwrap().approved_by_owner, true);
+}
+
+
+// ---- Issue #399: Dispute Resolution Tests ----
+
+#[test]
+fn test_file_dispute() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Funds are incorrect");
+    
+    // Beneficiary files dispute
+    client.file_dispute(&vault_id, &reason);
+    
+    // Verify dispute status
+    let status = client.get_dispute_status(&vault_id);
+    assert_eq!(status, DisputeStatus::Filed);
+}
+
+#[test]
+fn test_file_dispute_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Some reason");
+    
+    // Non-beneficiary cannot file dispute
+    let result = client.try_file_dispute(&vault_id, &reason);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_resolve_dispute() {
+    let (env, owner, beneficiary, admin, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Funds are incorrect");
+    let resolution = String::from_str(&env, "Verified and approved");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Admin resolves dispute
+    client.resolve_dispute(&vault_id, &resolution);
+    
+    // Verify dispute resolved
+    let status = client.get_dispute_status(&vault_id);
+    assert_eq!(status, DisputeStatus::Resolved);
+}
+
+#[test]
+fn test_resolve_dispute_admin_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "Some reason");
+    let resolution = String::from_str(&env, "Resolved");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Non-admin cannot resolve
+    let result = client.try_resolve_dispute(&vault_id, &resolution);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cannot_file_duplicate_dispute() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    let reason = String::from_str(&env, "First dispute");
+    let reason2 = String::from_str(&env, "Second dispute");
+    
+    client.file_dispute(&vault_id, &reason);
+    
+    // Cannot file another dispute while one is pending
+    let result = client.try_file_dispute(&vault_id, &reason2);
+    assert!(result.is_err());
+}
