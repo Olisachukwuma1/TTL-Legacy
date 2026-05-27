@@ -731,6 +731,11 @@ impl TtlVaultContract {
         // Log passkey usage - Issue #395
         Self::log_passkey_usage(&env, vault_id, &passkey_hash, now);
         
+        // Issue #478: record history for adaptive interval
+        Self::record_check_in_history(&env, vault_id, now);
+        // Issue #479: update streak
+        Self::update_check_in_streak(&env, vault_id, &vault, now);
+
         Self::log_audit_entry(&env, vault_id, "check_in", &caller, "");
         Self::append_activity_log(&env, vault_id, "check_in", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
