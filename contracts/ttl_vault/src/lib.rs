@@ -38,6 +38,7 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    CLIFF_REACHED_TOPIC,
 };
 
 #[cfg(test)]
@@ -148,6 +149,8 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    // Issue #534: vesting cliff period not yet reached
+    CliffNotReached = 55,
 }
 
 #[contract]
@@ -1984,6 +1987,7 @@ impl TtlVaultContract {
     /// * `start_time` - Unix timestamp of the first claimable installment
     /// * `interval` - Seconds between installments (must be > 0)
     /// * `num_installments` - Number of tranches (must be > 0)
+    /// * `cliff_period` - Seconds after `start_time` before any installment can be claimed (0 = no cliff)
     ///
     /// # Errors
     /// * `ContractError::Paused` - If the contract is paused
@@ -1998,6 +2002,7 @@ impl TtlVaultContract {
         start_time: u64,
         interval: u64,
         num_installments: u32,
+        cliff_period: u64,
     ) -> Result<(), ContractError> {
         Self::assert_not_paused(&env);
         caller.require_auth();
@@ -2020,6 +2025,7 @@ impl TtlVaultContract {
             num_installments,
             claimed_installments: 0,
             total_amount: vault.balance,
+            cliff_period,
         };
         let key = DataKey::VestingSchedule(vault_id);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
@@ -2028,7 +2034,7 @@ impl TtlVaultContract {
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         env.events().publish(
             (SET_VESTING_TOPIC, vault_id),
-            (start_time, interval, num_installments, vault.balance),
+            (start_time, interval, num_installments, vault.balance, cliff_period),
         );
         Ok(())
     }
@@ -2082,6 +2088,17 @@ impl TtlVaultContract {
         let now = env.ledger().timestamp();
         if now < schedule.start_time {
             return Err(ContractError::NothingToClaimYet);
+        }
+
+        // Enforce cliff: no claims until start_time + cliff_period has elapsed
+        if schedule.cliff_period > 0 && now < schedule.start_time + schedule.cliff_period {
+            return Err(ContractError::CliffNotReached);
+        }
+
+        // Emit cliff reached event on the first claim after cliff (cliff_period > 0 and no prior claims)
+        let cliff_just_reached = schedule.cliff_period > 0 && schedule.claimed_installments == 0;
+        if cliff_just_reached {
+            env.events().publish((CLIFF_REACHED_TOPIC, vault_id), (now,));
         }
 
         // How many installments are unlocked so far?

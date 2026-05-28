@@ -21,6 +21,8 @@ pub const PAUSE_TOPIC: Symbol = symbol_short!("pause");
 pub const UNPAUSE_TOPIC: Symbol = symbol_short!("unpause");
 pub const SET_VESTING_TOPIC: Symbol = symbol_short!("set_vest");
 pub const CLAIM_VEST_TOPIC: Symbol = symbol_short!("clm_vest");
+// Issue #534: vesting cliff period reached
+pub const CLIFF_REACHED_TOPIC: Symbol = symbol_short!("clif_rch");
 pub const PAUSE_VAULT_TOPIC: Symbol = symbol_short!("v_pause");
 pub const RESUME_VAULT_TOPIC: Symbol = symbol_short!("v_resume");
 pub const SET_METADATA_TOPIC: Symbol = symbol_short!("set_meta");
@@ -205,6 +207,7 @@ pub struct CheckInStreak {
 /// A vesting schedule attached to a vault.
 /// Funds are released in `num_installments` equal tranches, each separated by `interval` seconds.
 /// The first installment becomes claimable at `start_time`.
+/// If `cliff_period` > 0, no installments can be claimed until `start_time + cliff_period` has elapsed.
 #[contracttype]
 #[derive(Clone)]
 pub struct VestingSchedule {
@@ -219,6 +222,9 @@ pub struct VestingSchedule {
     /// Total amount to vest (in stroops). Each installment = total_amount / num_installments,
     /// with the last installment absorbing any remainder.
     pub total_amount: i128,
+    /// Cliff duration in seconds from `start_time`. No funds are claimable until
+    /// `start_time + cliff_period` has elapsed. Set to 0 to disable.
+    pub cliff_period: u64,
 }
 
 #[contracttype]

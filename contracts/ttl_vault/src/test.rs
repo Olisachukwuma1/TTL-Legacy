@@ -2311,7 +2311,7 @@ fn setup_vesting(
     let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
     client.deposit(&vault_id, owner, &amount);
     let start_time = env.ledger().timestamp() + 200; // first installment after expiry
-    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments);
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &0u64);
     // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2325,7 +2325,7 @@ fn test_set_vesting_schedule_stores_schedule() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     let sched = client.get_vesting_schedule(&vault_id).unwrap();
     assert_eq!(sched.start_time, start);
@@ -2333,6 +2333,7 @@ fn test_set_vesting_schedule_stores_schedule() {
     assert_eq!(sched.num_installments, 4u32);
     assert_eq!(sched.claimed_installments, 0u32);
     assert_eq!(sched.total_amount, 1_000i128);
+    assert_eq!(sched.cliff_period, 0u64);
 }
 
 #[test]
@@ -2344,7 +2345,7 @@ fn test_set_vesting_schedule_requires_owner() {
     let stranger = Address::generate(&env);
     let start = env.ledger().timestamp() + 50;
     let err = client
-        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &stranger, &start, &100u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::NotOwner);
@@ -2357,7 +2358,7 @@ fn test_set_vesting_schedule_rejects_zero_interval() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &0u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2370,7 +2371,7 @@ fn test_set_vesting_schedule_rejects_zero_installments() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &0u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::InvalidInterval);
@@ -2383,7 +2384,7 @@ fn test_set_vesting_schedule_rejects_empty_vault() {
     // No deposit — balance is 0
 
     let err = client
-        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32)
+        .try_set_vesting_schedule(&vault_id, &owner, &0u64, &100u64, &4u32, &0u64)
         .unwrap_err()
         .unwrap();
     assert_eq!(err, ContractError::EmptyVault);
@@ -2463,7 +2464,7 @@ fn test_claim_nothing_to_claim_before_start_time() {
 
     // start_time is far in the future
     let start = env.ledger().timestamp() + 10_000;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     // Expire and release
     env.ledger().with_mut(|l| l.timestamp += 200);
@@ -2532,7 +2533,7 @@ fn test_vesting_with_multi_beneficiary_split() {
     client.set_beneficiaries(&vault_id, &owner, &entries);
 
     let start = env.ledger().timestamp() + 200;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &2u32, &0u64);
 
     env.ledger().with_mut(|l| l.timestamp += 200);
     client.trigger_release(&vault_id);
@@ -2551,7 +2552,7 @@ fn test_set_vesting_emits_event() {
     client.deposit(&vault_id, &owner, &1_000i128);
 
     let start = env.ledger().timestamp() + 50;
-    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32);
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &0u64);
 
     assert!(find_event_by_topic(&env, types::SET_VESTING_TOPIC));
 }
@@ -2565,6 +2566,136 @@ fn test_claim_vested_emits_event() {
     client.claim_vested_installment(&vault_id);
 
     assert!(find_event_by_topic(&env, types::CLAIM_VEST_TOPIC));
+}
+
+// ---- Cliff period tests (#534) ----
+
+/// Helper: set up a vesting schedule with a cliff period.
+/// cliff_period is in seconds from start_time.
+fn setup_vesting_with_cliff(
+    env: &Env,
+    owner: &Address,
+    beneficiary: &Address,
+    client: &TtlVaultContractClient<'static>,
+    amount: i128,
+    num_installments: u32,
+    interval: u64,
+    cliff_period: u64,
+) -> u64 {
+    let vault_id = client.create_vault(owner, beneficiary, &100u64, &None);
+    client.deposit(&vault_id, owner, &amount);
+    let start_time = env.ledger().timestamp() + 200;
+    client.set_vesting_schedule(&vault_id, owner, &start_time, &interval, &num_installments, &cliff_period);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+    vault_id
+}
+
+#[test]
+fn test_cliff_period_stored_in_schedule() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &1_000i128);
+
+    let start = env.ledger().timestamp() + 50;
+    client.set_vesting_schedule(&vault_id, &owner, &start, &100u64, &4u32, &500u64);
+
+    let sched = client.get_vesting_schedule(&vault_id).unwrap();
+    assert_eq!(sched.cliff_period, 500u64);
+}
+
+#[test]
+fn test_claim_blocked_before_cliff() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 300s, interval = 100s; after trigger_release we are at start_time
+    // so cliff has NOT been reached yet
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 300u64);
+
+    // Advance 100s — past first installment window but still inside cliff
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    let err = client
+        .try_claim_vested_installment(&vault_id)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, ContractError::CliffNotReached);
+}
+
+#[test]
+fn test_claim_allowed_after_cliff() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // cliff = 200s, interval = 100s; 4 installments of 250 each
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 200u64);
+
+    // Advance 200s — cliff is now reached; 3 installment windows have elapsed
+    env.ledger().with_mut(|l| l.timestamp += 200);
+
+    let claimed = client.claim_vested_installment(&vault_id);
+    assert_eq!(claimed, 750i128); // 3 installments × 250
+    assert_eq!(token_client.balance(&beneficiary), 750i128);
+}
+
+#[test]
+fn test_cliff_reached_event_emitted_on_first_claim() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 100s
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 100u64);
+
+    // Advance past cliff
+    env.ledger().with_mut(|l| l.timestamp += 100);
+
+    client.claim_vested_installment(&vault_id);
+
+    assert!(find_event_by_topic(&env, types::CLIFF_REACHED_TOPIC));
+}
+
+#[test]
+fn test_cliff_reached_event_not_emitted_on_second_claim() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    // cliff = 100s, interval = 100s
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 100u64);
+
+    // First claim (past cliff)
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim_vested_installment(&vault_id);
+
+    // Clear events by checking count before second claim
+    let events_after_first = env.events().all().len();
+
+    // Second claim — no cliff event expected
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.claim_vested_installment(&vault_id);
+
+    // Verify no additional CLIFF_REACHED event was emitted
+    let new_events: soroban_sdk::Vec<_> = env.events().all();
+    let cliff_topic = types::CLIFF_REACHED_TOPIC;
+    let mut cliff_count = 0u32;
+    for i in events_after_first..new_events.len() {
+        let (topics, _): (soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) = new_events.get(i).unwrap();
+        if topics.len() > 0 {
+            if let Ok(t) = soroban_sdk::Symbol::try_from(topics.get(0).unwrap()) {
+                if t == cliff_topic {
+                    cliff_count += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cliff_count, 0, "CLIFF_REACHED should not be emitted on second claim");
+}
+
+#[test]
+fn test_zero_cliff_period_behaves_as_no_cliff() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let token_client = token::Client::new(&env, &token_address);
+
+    // cliff_period = 0 → no cliff, first installment claimable at start_time
+    let vault_id = setup_vesting_with_cliff(&env, &owner, &beneficiary, &client, 1_000i128, 4, 100u64, 0u64);
+
+    let claimed = client.claim_vested_installment(&vault_id);
+    assert_eq!(claimed, 250i128);
+    assert_eq!(token_client.balance(&beneficiary), 250i128);
 }
 
 #[test]
