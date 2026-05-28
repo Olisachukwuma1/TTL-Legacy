@@ -90,3 +90,67 @@ To restore an archived vault:
 3. The vault becomes accessible again with extended TTL
 
 The `trigger_release` function automatically attempts restoration if the vault is archived.
+
+## TTL Borrowing (Emergency)
+
+Vault owners can temporarily borrow TTL from another vault they own during emergencies:
+
+```rust
+borrow_ttl(borrower_vault_id, lender_vault_id, caller, borrow_seconds) -> Result<(), ContractError>
+repay_ttl_borrow(borrower_vault_id, caller) -> Result<(), ContractError>
+get_ttl_borrow(borrower_vault_id) -> Option<TtlBorrowRecord>
+```
+
+- The lender vault's `last_check_in` is reduced by `borrow_seconds` (shortening its TTL)
+- The borrower vault's `last_check_in` is extended by `borrow_seconds` (pushing its expiry forward)
+- A `TtlBorrowRecord` is stored on-chain for auditability
+- The borrow can be repaid to restore the lender's TTL
+- Events: `ttl_bor` (borrow created), `ttl_rep` (borrow repaid)
+
+## Check-in Rate Limiting
+
+To prevent storage abuse from excessive check-ins, a minimum cooldown can be enforced:
+
+```rust
+set_min_checkin_cooldown(cooldown_seconds)   // admin-only
+get_min_checkin_cooldown() -> u64
+get_last_checkin_time(vault_id) -> Option<u64>
+```
+
+- Default cooldown: 60 seconds
+- Set to 0 to disable rate limiting
+- Check-ins within the cooldown window return `CheckInTooFrequent` (error 54)
+- Event: `ci_rl` emitted when the cooldown setting is updated
+
+## Accelerated TTL Decay
+
+Owners can voluntarily shorten their vault's remaining TTL to make it expire sooner:
+
+```rust
+accelerate_ttl_decay(vault_id, caller, accelerate_by_seconds) -> Result<(), ContractError>
+```
+
+- Reduces `last_check_in` by `accelerate_by_seconds`, moving the expiry deadline forward
+- Capped at 30 days (`MAX_ACCELERATE_SECONDS = 2_592_000`) per call
+- Cannot push expiry to the current time or past (must leave ≥ 1 second remaining)
+- Returns `InsufficientTtlToAccelerate` (error 55) if the remaining TTL is too small
+- Event: `ttl_acc` with `(accelerated_seconds, new_remaining_ttl)`
+
+## Geographic Check-in Tracking
+
+Check-ins can include geographic location metadata for security and anomaly detection:
+
+```rust
+check_in_with_geo(
+    vault_id, caller, passkey_hash,
+    latitude_micro, longitude_micro, country_code
+) -> Result<(), ContractError>
+get_geo_checkin_log(vault_id) -> Vec<GeoCheckInEntry>
+```
+
+- `latitude_micro` / `longitude_micro` are in microdegrees (e.g. `37_422_000` = 37.422°)
+- `country_code` is an ISO 3166-1 alpha-2 string (e.g. `"US"`)
+- All standard `check_in` validations apply (owner auth, rate limiting, passkey expiry, TTL cap)
+- Location history is stored persistently under `CheckInGeoLog(vault_id)` and queryable on-chain
+- Off-chain indexers can detect anomalies (e.g. check-in from unexpected country)
+- Events: `ci_geo` (location + timestamp) and `check_in` (standard check-in event)
