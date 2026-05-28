@@ -30,6 +30,7 @@ This Soroban implementation makes TTL-Legacy:
 - **Check-In**: Extend the contract TTL to reset the countdown
 - **Automatic Release**: Funds transfer to beneficiary when TTL lapses
 - **Beneficiary Conditional Acceptance**: Beneficiary can accept role only if funds exceed threshold
+- **Beneficiary Conflict Resolution**: Automated conflict resolution when multiple beneficiaries claim same vault
 - **Passkey Auth**: WebAuthn-based authentication for all owner actions
 - **Reminder System**: Backend sends encrypted email/SMS check-in reminders
 - **Legacy Dashboard**: Minimalist frontend to manage vault state and history
@@ -128,6 +129,7 @@ The script will display the target network and identity, then require you to typ
 - [TTL & State Archival Logic](docs/ttl-logic.md)
 - [Passkey Integration](docs/passkeys.md)
 - [Beneficiary Conditional Acceptance](docs/beneficiary-conditional-acceptance.md)
+- [Beneficiary Conflict Resolution](docs/beneficiary-conflict-resolution.md)
 - [Threat Model & Security](docs/security.md)
 - [Security Policy & Vulnerability Disclosure](SECURITY.md)
 - [Roadmap](docs/roadmap.md)

@@ -15,6 +15,7 @@ use types::{
     TtlBorrowRecord,
     GeoCheckInEntry,
     BeneficiaryConditionalAcceptance,
+    BeneficiaryConflict, BeneficiaryConflictClaim, ConflictResolution,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -26,7 +27,8 @@ use types::{
     DISPUTE_FILED_TOPIC, DISPUTE_RESOLVED_TOPIC, WITHDRAWAL_SCHEDULED_TOPIC, WITHDRAWAL_EXECUTED_TOPIC,
     CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC, SET_MAX_TTL_TOPIC, SET_DECAY_RATE_TOPIC,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, TTL_DECAY_TOPIC, SYNC_TTL_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
-    BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
+    BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, BENEFICIARY_CONDITION_ACCEPTED_TOPIC, 
+    BENEFICIARY_CONFLICT_FILED_TOPIC, BENEFICIARY_CONFLICT_RESOLVED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
     RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
@@ -4648,6 +4650,98 @@ impl TtlVaultContract {
             .persistent()
             .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
             .unwrap_or(DisputeStatus::None)
+    }
+
+    // --- Issue #502: Beneficiary Conflict Resolution ---
+
+    /// File a beneficiary conflict claim. Beneficiary-only.
+    pub fn file_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        vault.beneficiary.require_auth();
+
+        if reason.len() == 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let mut conflict = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
+            .unwrap_or_else(|| BeneficiaryConflict {
+                vault_id,
+                claims: Vec::new(&env),
+                resolution: ConflictResolution::Pending,
+                resolved_at: None,
+            });
+
+        let claim = BeneficiaryConflictClaim {
+            claimant: vault.beneficiary.clone(),
+            reason,
+            filed_at: env.ledger().timestamp(),
+        };
+
+        conflict.claims.push_back(claim);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConflict(vault_id), &conflict);
+
+        env.events().publish(
+            (BENEFICIARY_CONFLICT_FILED_TOPIC,),
+            (vault_id, vault.beneficiary.clone()),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryConflict(vault_id),
+            VAULT_TTL_THRESHOLD,
+            vault_ttl_ledgers(vault.check_in_interval),
+        );
+        Ok(())
+    }
+
+    /// Resolve beneficiary conflict. Admin-only.
+    pub fn resolve_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+        approved_beneficiary: Address,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env);
+
+        let mut conflict = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
+            .ok_or(ContractError::InvalidBeneficiary)?;
+
+        if conflict.resolution != ConflictResolution::Pending {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        conflict.resolution = ConflictResolution::Approved(approved_beneficiary.clone());
+        conflict.resolved_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::BeneficiaryConflict(vault_id), &conflict);
+
+        env.events().publish(
+            (BENEFICIARY_CONFLICT_RESOLVED_TOPIC,),
+            (vault_id, approved_beneficiary),
+        );
+        Ok(())
+    }
+
+    /// Get beneficiary conflict if it exists.
+    pub fn get_beneficiary_conflict(
+        env: Env,
+        vault_id: u64,
+    ) -> Option<BeneficiaryConflict> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, BeneficiaryConflict>(&DataKey::BeneficiaryConflict(vault_id))
     }
 
     // ── Multi-sig ────────────────────────────────────────────────────────────

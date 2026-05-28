@@ -4254,3 +4254,134 @@ fn test_get_release_votes_empty_by_default() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
+
+// ---- Issue #502: Beneficiary Conflict Resolution ----
+
+#[test]
+fn test_file_beneficiary_conflict_beneficiary_only() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "Conflicting claim from another party");
+    client.file_beneficiary_conflict(&vault_id, &reason).unwrap();
+
+    let conflict = client.get_beneficiary_conflict(&vault_id);
+    assert!(conflict.is_some());
+    assert_eq!(conflict.unwrap().claims.len(), 1);
+}
+
+#[test]
+fn test_file_beneficiary_conflict_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "Conflicting claim");
+    env.mock_all_auths_allowing_non_root_auth();
+    let result = client.try_file_beneficiary_conflict(&vault_id, &reason);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_file_beneficiary_conflict_empty_reason_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "");
+    let result = client.try_file_beneficiary_conflict(&vault_id, &reason);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_resolve_beneficiary_conflict_admin_only() {
+    let (env, owner, beneficiary, admin, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "Conflicting claim");
+    client.file_beneficiary_conflict(&vault_id, &reason).unwrap();
+
+    client.resolve_beneficiary_conflict(&vault_id, &beneficiary).unwrap();
+
+    let conflict = client.get_beneficiary_conflict(&vault_id);
+    assert!(conflict.is_some());
+    assert!(matches!(conflict.unwrap().resolution, ConflictResolution::Approved(_)));
+}
+
+#[test]
+fn test_resolve_beneficiary_conflict_non_admin_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "Conflicting claim");
+    client.file_beneficiary_conflict(&vault_id, &reason).unwrap();
+
+    env.mock_all_auths_allowing_non_root_auth();
+    let result = client.try_resolve_beneficiary_conflict(&vault_id, &beneficiary);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_resolve_beneficiary_conflict_no_conflict_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let result = client.try_resolve_beneficiary_conflict(&vault_id, &beneficiary);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_get_beneficiary_conflict_not_set() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let conflict = client.get_beneficiary_conflict(&vault_id);
+    assert!(conflict.is_none());
+}
+
+#[test]
+fn test_file_multiple_beneficiary_conflicts() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason1 = String::from_str(&env, "First conflict");
+    client.file_beneficiary_conflict(&vault_id, &reason1).unwrap();
+
+    let reason2 = String::from_str(&env, "Second conflict");
+    client.file_beneficiary_conflict(&vault_id, &reason2).unwrap();
+
+    let conflict = client.get_beneficiary_conflict(&vault_id);
+    assert!(conflict.is_some());
+    assert_eq!(conflict.unwrap().claims.len(), 2);
+}
+
+#[test]
+fn test_beneficiary_conflict_stores_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let before = env.ledger().timestamp();
+    let reason = String::from_str(&env, "Conflict claim");
+    client.file_beneficiary_conflict(&vault_id, &reason).unwrap();
+    let after = env.ledger().timestamp();
+
+    let conflict = client.get_beneficiary_conflict(&vault_id);
+    assert!(conflict.is_some());
+    let claim = conflict.unwrap().claims.get(0).unwrap();
+    assert!(claim.filed_at >= before && claim.filed_at <= after);
+}
+
+#[test]
+fn test_beneficiary_conflict_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+
+    let reason = String::from_str(&env, "Conflict claim");
+    client.file_beneficiary_conflict(&vault_id, &reason).unwrap();
+
+    let events = env.events().all();
+    let event_found = events.iter().any(|e| {
+        e.topics.get(0).map_or(false, |t| {
+            t.to_val(&env).to_string().contains("ben_conf")
+        })
+    });
+    assert!(event_found, "BENEFICIARY_CONFLICT_FILED_TOPIC event not found");
+}
