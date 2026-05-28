@@ -4082,3 +4082,209 @@ fn test_get_release_votes_empty_by_default() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
+
+// ── clone_vault_with_overrides tests ─────────────────────────────────────────
+
+#[test]
+fn test_clone_vault_with_overrides_copies_all_when_none() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.update_metadata(&source_id, &owner, &soroban_sdk::String::from_str(&env, "template")).unwrap();
+
+    let new_beneficiary = Address::generate(&env);
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &None, &None, &None,
+    );
+
+    let cloned = client.get_vault(&new_id);
+    assert_eq!(cloned.check_in_interval, 3600);
+    assert_eq!(cloned.metadata, soroban_sdk::String::from_str(&env, "template"));
+    assert_eq!(cloned.beneficiary, new_beneficiary);
+    assert_eq!(cloned.balance, 0);
+    assert_eq!(cloned.parent_vault_id, Some(source_id));
+}
+
+#[test]
+fn test_clone_vault_with_overrides_interval() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let new_beneficiary = Address::generate(&_);
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &Some(7200u64), &None, &None,
+    );
+
+    let cloned = client.get_vault(&new_id);
+    assert_eq!(cloned.check_in_interval, 7200);
+}
+
+#[test]
+fn test_clone_vault_with_overrides_metadata() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let new_beneficiary = Address::generate(&env);
+    let new_meta = soroban_sdk::String::from_str(&env, "overridden");
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &None, &None, &Some(new_meta.clone()),
+    );
+
+    assert_eq!(client.get_vault(&new_id).metadata, new_meta);
+}
+
+#[test]
+fn test_clone_vault_with_overrides_beneficiaries() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let b1 = Address::generate(&env);
+    let b2 = Address::generate(&env);
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: b1.clone(), bps: 6000 },
+        BeneficiaryEntry { address: b2.clone(), bps: 4000 },
+    ];
+
+    let new_beneficiary = Address::generate(&env);
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &None, &Some(entries), &None,
+    );
+
+    let cloned = client.get_vault(&new_id);
+    assert_eq!(cloned.beneficiaries.len(), 2);
+    assert_eq!(cloned.beneficiaries.get(0).unwrap().bps, 6000);
+    assert_eq!(cloned.beneficiaries.get(1).unwrap().bps, 4000);
+}
+
+#[test]
+fn test_clone_vault_with_overrides_all_fields() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let b1 = Address::generate(&env);
+    let entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: b1.clone(), bps: 10_000 },
+    ];
+    let new_beneficiary = Address::generate(&env);
+    let new_meta = soroban_sdk::String::from_str(&env, "all-overridden");
+
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &Some(86400u64), &Some(entries), &Some(new_meta.clone()),
+    );
+
+    let cloned = client.get_vault(&new_id);
+    assert_eq!(cloned.check_in_interval, 86400);
+    assert_eq!(cloned.metadata, new_meta);
+    assert_eq!(cloned.beneficiaries.len(), 1);
+}
+
+#[test]
+fn test_clone_vault_with_overrides_rejects_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let stranger = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+    let err = client.try_clone_vault_with_overrides(
+        &source_id, &stranger, &new_beneficiary,
+        &None, &None, &None,
+    ).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_clone_vault_with_overrides_rejects_owner_as_beneficiary() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_clone_vault_with_overrides(
+        &source_id, &owner, &owner,
+        &None, &None, &None,
+    ).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary
+}
+
+#[test]
+fn test_clone_vault_with_overrides_rejects_zero_interval() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let new_beneficiary = Address::generate(&env);
+    let err = client.try_clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &Some(0u64), &None, &None,
+    ).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(2)); // InvalidInterval
+}
+
+#[test]
+fn test_clone_vault_with_overrides_rejects_invalid_bps() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let b1 = Address::generate(&env);
+    // BPS sum = 5000, not 10000
+    let bad_entries = soroban_sdk::vec![
+        &env,
+        BeneficiaryEntry { address: b1.clone(), bps: 5000 },
+    ];
+    let new_beneficiary = Address::generate(&env);
+    let err = client.try_clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &None, &Some(bad_entries), &None,
+    ).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(12)); // InvalidBps
+}
+
+#[test]
+fn test_clone_vault_with_overrides_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let new_beneficiary = Address::generate(&env);
+    let new_id = client.clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &Some(7200u64), &None, &None,
+    );
+
+    let events = env.events().all();
+    // Find the VAULT_CLONED_OVERRIDE_TOPIC event
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.try_into_val(&env).unwrap_or(soroban_sdk::vec![&env]);
+        topics.len() > 0 && {
+            let t: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+            t.map(|s| s == soroban_sdk::Symbol::new(&env, "v_clo_ov")).unwrap_or(false)
+        }
+    });
+    assert!(found, "VAULT_CLONED_OVERRIDE_TOPIC event not emitted");
+    // Verify new vault was created
+    assert!(client.vault_exists(&new_id));
+}
+
+#[test]
+fn test_clone_vault_with_overrides_released_source_fails() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let source_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // Fund and expire the vault
+    let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+    let contract = client.address.clone();
+    // Deposit via the contract
+    client.deposit(&source_id, &owner, &100_000i128);
+    // Advance time past interval
+    env.ledger().with_mut(|l| l.timestamp += 3601);
+    client.trigger_release(&source_id);
+
+    let new_beneficiary = Address::generate(&env);
+    let err = client.try_clone_vault_with_overrides(
+        &source_id, &owner, &new_beneficiary,
+        &None, &None, &None,
+    ).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
+}

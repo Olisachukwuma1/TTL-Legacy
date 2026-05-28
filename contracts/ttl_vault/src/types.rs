@@ -50,6 +50,7 @@ pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
 pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
 pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
+pub const VAULT_CLONED_OVERRIDE_TOPIC: Symbol = symbol_short!("v_clo_ov");
 pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
 pub const MULTISIG_CONFIG_TOPIC: Symbol = symbol_short!("ms_cfg");
 pub const MULTISIG_PROPOSED_TOPIC: Symbol = symbol_short!("ms_prop");

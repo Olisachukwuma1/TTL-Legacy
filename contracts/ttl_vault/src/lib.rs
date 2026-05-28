@@ -26,7 +26,7 @@ use types::{
     CONDITIONS_ACCEPTED_TOPIC, SET_SPENDING_LIMIT_TOPIC, SET_MAX_TTL_TOPIC, SET_DECAY_RATE_TOPIC,
     ACCEPTANCE_DEADLINE_EXPIRED_TOPIC, TTL_DECAY_TOPIC, SYNC_TTL_TOPIC, PASSKEY_EXPIRY_EXTENDED_TOPIC,
     BENEFICIARY_ACCEPTED_TOPIC, BENEFICIARY_DECLINED_TOPIC, SET_RECOVERY_TOPIC, RECOVERY_EXTEND_TOPIC,
-    RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_MERGED_TOPIC,
+    RESTORE_VAULT_TOPIC, PASSKEY_USAGE_TOPIC, VAULT_CLONED_TOPIC, VAULT_CLONED_OVERRIDE_TOPIC, VAULT_MERGED_TOPIC,
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
     OWNERSHIP_CANCELLED_TOPIC,
@@ -3847,6 +3847,131 @@ impl TtlVaultContract {
 
         Self::append_activity_log(&env, new_vault_id, "clone_vault", &new_owner, "");
         env.events().publish((VAULT_CLONED_TOPIC,), (source_vault_id, new_vault_id, new_beneficiary));
+        new_vault_id
+    }
+
+    /// Clones a vault with selective parameter overrides.
+    ///
+    /// Behaves identically to `clone_vault` but allows the caller to override
+    /// any combination of `check_in_interval`, `beneficiaries`, and `metadata`
+    /// on the new vault. Fields left as `None` are copied from the source vault.
+    ///
+    /// # Arguments
+    /// * `source_vault_id`       - Vault to use as a template (must be Locked, owned by `new_owner`)
+    /// * `new_owner`             - Owner of the new vault (must authorize; must be source vault owner)
+    /// * `new_beneficiary`       - Primary beneficiary for the new vault
+    /// * `override_interval`     - `Some(seconds)` to use a different check-in interval, or `None` to copy
+    /// * `override_beneficiaries`- `Some(entries)` to replace the multi-beneficiary split, or `None` to copy
+    /// * `override_metadata`     - `Some(string)` to set different metadata, or `None` to copy
+    ///
+    /// # Returns
+    /// The new vault ID.
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`           - caller is not the source vault owner
+    /// * `ContractError::AlreadyReleased`    - source vault is not Locked
+    /// * `ContractError::InvalidBeneficiary` - new_owner == new_beneficiary
+    /// * `ContractError::InvalidInterval`    - override_interval is 0
+    /// * `ContractError::IntervalTooLow/High`- override_interval outside configured bounds
+    /// * `ContractError::InvalidBps`         - override_beneficiaries BPS sum ≠ 10 000
+    /// * `ContractError::InvalidAmount`      - override_metadata exceeds MAX_METADATA_LEN
+    pub fn clone_vault_with_overrides(
+        env: Env,
+        source_vault_id: u64,
+        new_owner: Address,
+        new_beneficiary: Address,
+        override_interval: Option<u64>,
+        override_beneficiaries: Option<Vec<BeneficiaryEntry>>,
+        override_metadata: Option<String>,
+    ) -> u64 {
+        new_owner.require_auth();
+        let original = Self::load_vault(&env, source_vault_id);
+        if new_owner != original.owner {
+            panic_with_error!(&env, ContractError::NotOwner);
+        }
+        if original.status != ReleaseStatus::Locked {
+            panic_with_error!(&env, ContractError::AlreadyReleased);
+        }
+        if new_owner == new_beneficiary {
+            panic_with_error!(&env, ContractError::InvalidBeneficiary);
+        }
+
+        // Resolve interval override
+        let check_in_interval = match override_interval {
+            Some(interval) => {
+                if interval == 0 {
+                    panic_with_error!(&env, ContractError::InvalidInterval);
+                }
+                Self::assert_interval_in_bounds(&env, interval);
+                interval
+            }
+            None => original.check_in_interval,
+        };
+
+        // Resolve beneficiaries override
+        let beneficiaries = match override_beneficiaries {
+            Some(entries) => {
+                if !entries.is_empty() {
+                    let total_bps: u32 = entries.iter().map(|e| e.bps).sum();
+                    if total_bps != 10_000 {
+                        panic_with_error!(&env, ContractError::InvalidBps);
+                    }
+                    for entry in entries.iter() {
+                        if entry.address == new_owner {
+                            panic_with_error!(&env, ContractError::InvalidBeneficiary);
+                        }
+                    }
+                }
+                entries
+            }
+            None => original.beneficiaries.clone(),
+        };
+
+        // Resolve metadata override
+        let metadata = match override_metadata {
+            Some(m) => {
+                Self::assert_metadata_len(&env, &m);
+                m
+            }
+            None => original.metadata.clone(),
+        };
+
+        let new_vault_id = Self::vault_count(env.clone()) + 1;
+        let timestamp = env.ledger().timestamp();
+        let cloned_vault = Vault {
+            owner: new_owner.clone(),
+            beneficiary: new_beneficiary.clone(),
+            balance: 0,
+            check_in_interval,
+            last_check_in: timestamp,
+            created_at: timestamp,
+            status: ReleaseStatus::Locked,
+            beneficiaries,
+            metadata,
+            token_address: original.token_address.clone(),
+            custom_metadata: original.custom_metadata.clone(),
+            is_paused: false,
+            release_condition: original.release_condition.clone(),
+            parent_vault_id: Some(source_vault_id),
+            passkey_hash: None,
+            max_deposit_amount: original.max_deposit_amount,
+            withdrawal_approval_threshold: original.withdrawal_approval_threshold,
+            spending_limit: original.spending_limit,
+        };
+        Self::save_vault(&env, new_vault_id, &cloned_vault);
+        Self::add_owner_vault_id(&env, &new_owner, new_vault_id, check_in_interval);
+        Self::add_beneficiary_vault_id(&env, &new_beneficiary, new_vault_id, check_in_interval);
+
+        let key = DataKey::VaultCount;
+        env.storage().persistent().set(&key, &new_vault_id);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        Self::append_activity_log(&env, new_vault_id, "clone_vault_with_overrides", &new_owner, "");
+        env.events().publish(
+            (VAULT_CLONED_OVERRIDE_TOPIC,),
+            (source_vault_id, new_vault_id, new_beneficiary, check_in_interval),
+        );
         new_vault_id
     }
 
