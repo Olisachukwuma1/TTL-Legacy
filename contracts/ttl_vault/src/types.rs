@@ -80,6 +80,25 @@ pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
 // Issue #475: batch status query
 pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("b_stat");
 
+// Previously missing — used by lib.rs internal helpers
+pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
+pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integ");
+pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
+
+// Issue: TTL Borrowing
+pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
+pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
+
+// Issue: Check-in Rate Limiting
+pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
+
+// Issue: Accelerated TTL Decay
+pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
+
+// Issue: Geographic Check-in Tracking
+pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -475,4 +494,26 @@ pub struct VaultStatusSummary {
     pub balance: i128,
     pub last_check_in: u64,
     pub is_expired: bool,
+}
+
+/// A shared TTL pool that multiple vaults can join.
+/// A single `pool_check_in` resets `last_check_in` for all member vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlPool {
+    pub pool_id: u64,
+    pub owner: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub created_at: u64,
+}
+
+/// A biometric credential entry (fingerprint or face template hash).
+/// The raw biometric data never leaves the device — only the SHA-256
+/// hash commitment is stored on-chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct BiometricEntry {
+    pub credential_hash: BytesN<32>,
+    pub added_at: u64,
 }

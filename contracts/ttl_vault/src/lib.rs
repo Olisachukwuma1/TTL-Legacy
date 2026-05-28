@@ -12,6 +12,8 @@ use types::{
     ArchivedVaultInfo, OwnershipTransferRequest, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
+    TtlBorrowRecord,
+    GeoCheckInEntry,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -72,6 +74,12 @@ const OWNERSHIP_TRANSFER_TIMELOCK: u64 = 86_400;
 /// Expiry window for pending ownership transfer requests in seconds (7 days).
 /// If the new owner does not accept within this window, the request expires.
 const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
+
+/// Minimum seconds between consecutive check-ins (default: 60 seconds).
+const DEFAULT_MIN_CHECKIN_COOLDOWN: u64 = 60;
+
+/// Maximum seconds an owner can accelerate TTL decay per call (30 days).
+const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -708,6 +716,22 @@ impl TtlVaultContract {
         let original_last_check_in = vault.last_check_in;
         
         let now = env.ledger().timestamp();
+
+        // Rate limiting: enforce minimum cooldown between check-ins
+        let cooldown: u64 = env
+            .storage().instance()
+            .get(&DataKey::MinCheckInCooldown)
+            .unwrap_or(DEFAULT_MIN_CHECKIN_COOLDOWN);
+        if cooldown > 0 {
+            if let Some(last) = env.storage().persistent()
+                .get::<DataKey, u64>(&DataKey::LastCheckInTime(vault_id))
+            {
+                if now < last + cooldown {
+                    return Err(ContractError::CheckInTooFrequent);
+                }
+            }
+        }
+
         if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
             if now > expiry {
                 return Err(ContractError::InvalidPasskey);
@@ -733,7 +757,13 @@ impl TtlVaultContract {
         
         // Log passkey usage - Issue #395
         Self::log_passkey_usage(&env, vault_id, &passkey_hash, now);
-        
+
+        // Persist last check-in time for rate limiting
+        let lci_key = DataKey::LastCheckInTime(vault_id);
+        let lci_ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&lci_key, &now);
+        env.storage().persistent().extend_ttl(&lci_key, VAULT_TTL_THRESHOLD, lci_ttl);
+
         // Issue #478: record history for adaptive interval
         Self::record_check_in_history(&env, vault_id, now);
         // Issue #479: update streak
@@ -3036,6 +3066,308 @@ impl TtlVaultContract {
         let key = DataKey::Vault(vault_id);
         let ttl = vault_ttl_ledgers(check_in_interval);
         env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    /// Stub: records check-in timestamp for adaptive interval logic.
+    fn record_check_in_history(_env: &Env, _vault_id: u64, _timestamp: u64) {}
+
+    /// Stub: updates check-in streak counter.
+    fn update_check_in_streak(_env: &Env, _vault_id: u64, _vault: &Vault, _now: u64) {}
+
+    /// Returns the vault activity log (alias for get_vault_audit_log).
+    pub fn get_vault_activity_log(env: Env, vault_id: u64) -> Vec<AuditEntry> {
+        Self::get_vault_audit_log(env, vault_id)
+    }
+
+    /// Transfers vault ownership immediately (single-step, backwards-compatible).
+    pub fn transfer_ownership(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        new_owner: Address,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if new_owner == vault.beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        let old_owner = vault.owner.clone();
+        if old_owner != new_owner {
+            Self::remove_owner_vault_id(&env, &old_owner, vault_id, vault.check_in_interval);
+            Self::add_owner_vault_id(&env, &new_owner, vault_id, vault.check_in_interval);
+        }
+        vault.owner = new_owner.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        Self::log_audit_entry(&env, vault_id, "transfer_ownership", &caller, "");
+        Self::append_activity_log(&env, vault_id, "transfer_ownership", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((OWNERSHIP_TOPIC, vault_id), (old_owner, new_owner));
+        Ok(())
+    }
+
+    // ── Issue: TTL Borrowing ──────────────────────────────────────────────────
+
+    /// Temporarily borrows TTL from a lender vault to extend a borrower vault's expiry.
+    ///
+    /// The lender's remaining TTL is reduced by `borrow_seconds`; the borrower's
+    /// `last_check_in` is extended by the same amount. Only the borrower vault owner
+    /// may call this. A `TtlBorrowRecord` is stored for auditability and repayment.
+    ///
+    /// # Errors
+    /// * `Paused`              - contract is paused
+    /// * `NotOwner`            - caller is not borrower vault owner
+    /// * `AlreadyReleased`     - either vault is not Locked
+    /// * `InvalidAmount`       - borrow_seconds is 0 or vaults are the same
+    /// * `InsufficientBalance` - lender does not have enough remaining TTL
+    pub fn borrow_ttl(
+        env: Env,
+        borrower_vault_id: u64,
+        lender_vault_id: u64,
+        caller: Address,
+        borrow_seconds: u64,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if borrow_seconds == 0 || borrower_vault_id == lender_vault_id {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut borrower = Self::load_vault(&env, borrower_vault_id);
+        if caller != borrower.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if borrower.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let mut lender = Self::load_vault(&env, lender_vault_id);
+        if lender.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let now = env.ledger().timestamp();
+        let lender_deadline = lender.last_check_in + lender.check_in_interval;
+        let lender_remaining = if now >= lender_deadline { 0u64 } else { lender_deadline - now };
+        if lender_remaining <= borrow_seconds {
+            return Err(ContractError::InsufficientBalance);
+        }
+        borrower.last_check_in = borrower.last_check_in.saturating_add(borrow_seconds);
+        lender.last_check_in = lender.last_check_in.saturating_sub(borrow_seconds);
+        let record = TtlBorrowRecord {
+            lender_vault_id,
+            borrower_vault_id,
+            borrowed_seconds: borrow_seconds,
+            borrowed_at: now,
+            repaid: false,
+        };
+        let key = DataKey::TtlBorrow(borrower_vault_id);
+        let ttl = vault_ttl_ledgers(borrower.check_in_interval);
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        Self::save_vault(&env, borrower_vault_id, &borrower);
+        Self::save_vault(&env, lender_vault_id, &lender);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_BORROW_TOPIC, borrower_vault_id),
+            (lender_vault_id, borrow_seconds, now),
+        );
+        Ok(())
+    }
+
+    /// Repays a TTL borrow, restoring the lender vault's TTL.
+    ///
+    /// # Errors
+    /// * `NotOwner`               - caller is not borrower vault owner
+    /// * `TtlBorrowNotFound`      - no borrow record exists
+    /// * `TtlBorrowAlreadyRepaid` - borrow was already repaid
+    pub fn repay_ttl_borrow(
+        env: Env,
+        borrower_vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let borrower = Self::load_vault(&env, borrower_vault_id);
+        if caller != borrower.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::TtlBorrow(borrower_vault_id);
+        let mut record: TtlBorrowRecord = env
+            .storage().persistent().get(&key)
+            .ok_or(ContractError::TtlBorrowNotFound)?;
+        if record.repaid {
+            return Err(ContractError::TtlBorrowAlreadyRepaid);
+        }
+        let mut lender = Self::load_vault(&env, record.lender_vault_id);
+        lender.last_check_in = lender.last_check_in.saturating_add(record.borrowed_seconds);
+        Self::save_vault(&env, record.lender_vault_id, &lender);
+        record.repaid = true;
+        env.storage().persistent().set(&key, &record);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_REPAY_TOPIC, borrower_vault_id),
+            (record.lender_vault_id, record.borrowed_seconds),
+        );
+        Ok(())
+    }
+
+    /// Returns the active TTL borrow record for a vault, if any.
+    pub fn get_ttl_borrow(env: Env, borrower_vault_id: u64) -> Option<TtlBorrowRecord> {
+        env.storage().persistent().get(&DataKey::TtlBorrow(borrower_vault_id))
+    }
+
+    // ── Issue: Check-in Rate Limiting ─────────────────────────────────────────
+
+    /// Sets the minimum cooldown (seconds) between consecutive check-ins.
+    ///
+    /// Admin-only. Prevents owners from spamming check-ins to waste storage.
+    /// Set to 0 to disable rate limiting entirely.
+    pub fn set_min_checkin_cooldown(env: Env, cooldown_seconds: u64) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::MinCheckInCooldown, &cooldown_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((CHECKIN_RATE_LIMITED_TOPIC,), cooldown_seconds);
+    }
+
+    /// Returns the configured minimum check-in cooldown in seconds.
+    /// Defaults to `DEFAULT_MIN_CHECKIN_COOLDOWN` (60s) if not set.
+    pub fn get_min_checkin_cooldown(env: Env) -> u64 {
+        env.storage().instance()
+            .get(&DataKey::MinCheckInCooldown)
+            .unwrap_or(DEFAULT_MIN_CHECKIN_COOLDOWN)
+    }
+
+    /// Returns the timestamp of the most recent check-in for a vault.
+    /// Returns `None` if no check-in has been recorded yet.
+    pub fn get_last_checkin_time(env: Env, vault_id: u64) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::LastCheckInTime(vault_id))
+    }
+
+    // ── Issue: Accelerated TTL Decay ──────────────────────────────────────────
+
+    /// Allows the vault owner to accelerate TTL decay, making the vault expire sooner.
+    ///
+    /// Reduces `last_check_in` by `accelerate_by_seconds`, moving the expiry deadline
+    /// forward. Capped at `MAX_ACCELERATE_SECONDS` (30 days) per call. Cannot push
+    /// the deadline to the current time or past (must leave ≥ 1 second remaining).
+    ///
+    /// # Arguments
+    /// * `vault_id`              - The vault to accelerate
+    /// * `caller`                - Must be the vault owner
+    /// * `accelerate_by_seconds` - Seconds to shorten the remaining TTL by
+    ///
+    /// # Errors
+    /// * `Paused`                    - contract is paused
+    /// * `NotOwner`                  - caller is not vault owner
+    /// * `AlreadyReleased`           - vault is not Locked
+    /// * `InvalidAmount`             - accelerate_by_seconds is 0 or exceeds cap
+    /// * `InsufficientTtlToAccelerate` - would push expiry to now or past
+    pub fn accelerate_ttl_decay(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        accelerate_by_seconds: u64,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if accelerate_by_seconds == 0 || accelerate_by_seconds > MAX_ACCELERATE_SECONDS {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let now = env.ledger().timestamp();
+        let current_deadline = vault.last_check_in + vault.check_in_interval;
+        let remaining = if now >= current_deadline { 0u64 } else { current_deadline - now };
+        // Must leave at least 1 second of TTL remaining
+        if remaining <= accelerate_by_seconds {
+            return Err(ContractError::InsufficientTtlToAccelerate);
+        }
+        vault.last_check_in = vault.last_check_in.saturating_sub(accelerate_by_seconds);
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_ACCELERATE_TOPIC, vault_id),
+            (accelerate_by_seconds, remaining - accelerate_by_seconds),
+        );
+        Ok(())
+    }
+
+    // ── Issue: Geographic Check-in Tracking ───────────────────────────────────
+
+    /// Records a check-in with geographic location metadata for security and anomaly detection.
+    ///
+    /// Delegates to the standard `check_in` for all vault validations (owner auth,
+    /// rate limiting, passkey expiry, TTL cap). On success, appends a `GeoCheckInEntry`
+    /// to the vault's persistent geo log and emits a `ci_geo` event.
+    ///
+    /// # Arguments
+    /// * `vault_id`        - The vault to check in
+    /// * `caller`          - Must be the vault owner
+    /// * `passkey_hash`    - Passkey used for this check-in
+    /// * `latitude_micro`  - Latitude in microdegrees (e.g. 37_422_000 = 37.422°)
+    /// * `longitude_micro` - Longitude in microdegrees
+    /// * `country_code`    - ISO 3166-1 alpha-2 country code (e.g. "US")
+    ///
+    /// # Errors
+    /// Same as `check_in`.
+    pub fn check_in_with_geo(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+        latitude_micro: i64,
+        longitude_micro: i64,
+        country_code: String,
+    ) -> Result<(), ContractError> {
+        // Delegate to standard check_in for all validations
+        Self::check_in(env.clone(), vault_id, caller, passkey_hash)?;
+
+        let now = env.ledger().timestamp();
+        let entry = GeoCheckInEntry {
+            latitude_micro,
+            longitude_micro,
+            country_code: country_code.clone(),
+            timestamp: now,
+        };
+
+        let key = DataKey::CheckInGeoLog(vault_id);
+        let mut log: Vec<GeoCheckInEntry> = env
+            .storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        log.push_back(entry);
+
+        let vault = Self::load_vault(&env, vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.events().publish(
+            (CHECKIN_GEO_TOPIC, vault_id),
+            (latitude_micro, longitude_micro, country_code, now),
+        );
+        Ok(())
+    }
+
+    /// Returns the full geographic check-in history for a vault.
+    pub fn get_geo_checkin_log(env: Env, vault_id: u64) -> Vec<GeoCheckInEntry> {
+        env.storage().persistent()
+            .get(&DataKey::CheckInGeoLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn append_activity_log(env: &Env, vault_id: u64, action: &str, caller: &Address, _details: &str) {
