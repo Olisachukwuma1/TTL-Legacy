@@ -89,6 +89,8 @@ pub const RELEASE_VOTE_PASSED_TOPIC: Symbol = symbol_short!("vote_ok");
 pub const MILESTONE_VEST_TOPIC: Symbol = symbol_short!("m_vest");
 pub const MILESTONE_PROGRESS_TOPIC: Symbol = symbol_short!("m_prog");
 pub const MILESTONE_CLAIM_TOPIC: Symbol = symbol_short!("m_clm");
+pub const MILESTONE_PAUSE_TOPIC: Symbol = symbol_short!("m_paus");
+pub const MILESTONE_RESUME_TOPIC: Symbol = symbol_short!("m_resm");
 
 // Issue: TTL Borrowing
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
@@ -259,6 +261,8 @@ pub struct MilestoneVestingSchedule {
     pub claimed_amount: i128,
     /// Address authorized to report milestone progress
     pub oracle: Address,
+    /// Whether vesting is paused (progress reporting and claiming blocked)
+    pub paused: bool,
 }
 
 #[contracttype]

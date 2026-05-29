@@ -40,6 +40,7 @@ use types::{
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
     MILESTONE_VEST_TOPIC, MILESTONE_PROGRESS_TOPIC, MILESTONE_CLAIM_TOPIC,
+    MILESTONE_PAUSE_TOPIC, MILESTONE_RESUME_TOPIC,
     CHECKIN_GEO_TOPIC, CHECKIN_RATE_LIMITED_TOPIC, TTL_ACCELERATE_TOPIC,
     TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
 };
@@ -2064,6 +2065,7 @@ impl TtlVaultContract {
             milestones,
             claimed_amount: 0,
             oracle,
+            paused: false,
         };
         let key = DataKey::MilestoneVestingSchedule(vault_id);
         let ttl = vault_ttl_ledgers(vault.check_in_interval);
@@ -2080,6 +2082,98 @@ impl TtlVaultContract {
     /// Returns the milestone vesting schedule for a vault, if one exists.
     pub fn get_milestone_vesting_schedule(env: Env, vault_id: u64) -> Option<MilestoneVestingSchedule> {
         env.storage().persistent().get(&DataKey::MilestoneVestingSchedule(vault_id))
+    }
+
+    /// Pauses a milestone vesting schedule, blocking progress reporting and claiming.
+    ///
+    /// Only the vault owner can call this. The vesting state and milestone data are
+    /// preserved and can be resumed later via `resume_milestone_vesting`.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    pub fn pause_milestone_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
+        schedule.paused = true;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_PAUSE_TOPIC, vault_id), true);
+        Ok(())
+    }
+
+    /// Resumes a paused milestone vesting schedule, re-enabling progress reporting and claiming.
+    ///
+    /// Only the vault owner can call this. All milestone progress and state is preserved
+    /// from before the pause.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `vault_id` - The vault ID
+    /// * `caller` - The address of the caller (must be vault owner)
+    ///
+    /// # Errors
+    /// * `ContractError::Paused` - If the contract is paused
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::VestingNotFound` - If no milestone vesting schedule exists
+    pub fn resume_milestone_vesting(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::MilestoneVestingSchedule(vault_id);
+        let mut schedule: MilestoneVestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::VestingNotFound)?;
+
+        if !schedule.paused {
+            return Err(ContractError::Paused);
+        }
+        schedule.paused = false;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &schedule);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((MILESTONE_RESUME_TOPIC, vault_id), false);
+        Ok(())
     }
 
     /// Reports progress on one or more milestones.
@@ -2115,6 +2209,10 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::MilestoneVestingSchedule(vault_id))
             .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
 
         schedule.oracle.require_auth();
 
@@ -2196,6 +2294,10 @@ impl TtlVaultContract {
             .persistent()
             .get(&DataKey::MilestoneVestingSchedule(vault_id))
             .ok_or(ContractError::VestingNotFound)?;
+
+        if schedule.paused {
+            return Err(ContractError::Paused);
+        }
 
         // Calculate claimable amounts from fulfilled milestones
         let mut total_claimable = 0i128;
