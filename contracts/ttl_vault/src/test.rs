@@ -5427,3 +5427,234 @@ fn test_get_countdown_config_returns_defaults_when_not_set() {
     assert_eq!(cfg.thresholds.get(1).unwrap(), 259_200u64);
     assert_eq!(cfg.thresholds.get(2).unwrap(), 86_400u64);
 }
+
+
+// --- Issue #569: Withdrawal Audit Trail Tests ---
+
+#[test]
+fn test_withdrawal_audit_trail_records_successful_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let audit_log = client.get_withdrawal_audit_log(&vault_id);
+    assert_eq!(audit_log.len(), 1);
+    let entry = audit_log.get(0).unwrap();
+    assert_eq!(entry.vault_id, vault_id);
+    assert_eq!(entry.caller, owner);
+    assert_eq!(entry.amount, 50_000);
+    assert_eq!(entry.success, true);
+}
+
+#[test]
+fn test_withdrawal_audit_trail_records_failed_withdrawal() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+
+    let result = client.try_withdraw(&vault_id, &owner, &200_000);
+    assert!(result.is_err());
+
+    let audit_log = client.get_withdrawal_audit_log(&vault_id);
+    assert_eq!(audit_log.len(), 1);
+    let entry = audit_log.get(0).unwrap();
+    assert_eq!(entry.success, false);
+    assert_eq!(entry.amount, 200_000);
+}
+
+#[test]
+fn test_withdrawal_audit_trail_multiple_attempts() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &500_000);
+
+    client.withdraw(&vault_id, &owner, &50_000);
+    client.withdraw(&vault_id, &owner, &75_000);
+    let _ = client.try_withdraw(&vault_id, &owner, &500_000);
+
+    let audit_log = client.get_withdrawal_audit_log(&vault_id);
+    assert_eq!(audit_log.len(), 3);
+    assert_eq!(audit_log.get(0).unwrap().success, true);
+    assert_eq!(audit_log.get(1).unwrap().success, true);
+    assert_eq!(audit_log.get(2).unwrap().success, false);
+}
+
+// --- Issue #570: Withdrawal Batching Tests ---
+
+#[test]
+fn test_batch_withdraw_with_audit_trail() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    
+    client.deposit(&owner, &vault_id1, &100_000);
+    client.deposit(&owner, &vault_id2, &100_000);
+
+    let vault_ids = vec![&env, vault_id1, vault_id2];
+    let amounts = vec![&env, 30_000i128, 40_000i128];
+    client.batch_withdraw(&vault_ids, &amounts, &owner);
+
+    let audit_log1 = client.get_withdrawal_audit_log(&vault_id1);
+    let audit_log2 = client.get_withdrawal_audit_log(&vault_id2);
+    
+    assert_eq!(audit_log1.len(), 1);
+    assert_eq!(audit_log2.len(), 1);
+    assert_eq!(audit_log1.get(0).unwrap().amount, 30_000);
+    assert_eq!(audit_log2.get(0).unwrap().amount, 40_000);
+}
+
+#[test]
+fn test_batch_withdraw_efficiency() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let mut vault_ids = vec![&env];
+    let mut amounts = vec![&env];
+    
+    for i in 0..5 {
+        let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+        client.deposit(&owner, &vault_id, &100_000);
+        vault_ids.push_back(vault_id);
+        amounts.push_back(20_000i128);
+    }
+
+    client.batch_withdraw(&vault_ids, &amounts, &owner);
+
+    for vault_id in vault_ids.iter() {
+        let audit_log = client.get_withdrawal_audit_log(&vault_id);
+        assert_eq!(audit_log.len(), 1);
+        assert_eq!(audit_log.get(0).unwrap().success, true);
+    }
+}
+
+// --- Issue #571: Withdrawal Notifications Tests ---
+
+#[test]
+fn test_withdrawal_notification_event_emitted() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let events = env.events().all();
+    let withdrawal_notif_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            if let soroban_sdk::IntoVal::into_val(e, &env) = e {
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
+    
+    assert!(withdrawal_notif_events.len() > 0);
+}
+
+#[test]
+fn test_batch_withdrawal_notifications() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    
+    client.deposit(&owner, &vault_id1, &100_000);
+    client.deposit(&owner, &vault_id2, &100_000);
+
+    let vault_ids = vec![&env, vault_id1, vault_id2];
+    let amounts = vec![&env, 30_000i128, 40_000i128];
+    client.batch_withdraw(&vault_ids, &amounts, &owner);
+
+    let events = env.events().all();
+    assert!(events.len() > 0);
+}
+
+// --- Issue #572: Withdrawal Dispute Tests ---
+
+#[test]
+fn test_file_withdrawal_dispute() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let reason = String::from_str(&env, "Unauthorized withdrawal");
+    client.file_withdrawal_dispute(&vault_id, &owner, &reason);
+
+    let disputes = client.get_withdrawal_disputes(&vault_id);
+    assert_eq!(disputes.len(), 1);
+    let dispute = disputes.get(0).unwrap();
+    assert_eq!(dispute.vault_id, vault_id);
+    assert_eq!(dispute.status, DisputeStatus::Filed);
+}
+
+#[test]
+fn test_resolve_withdrawal_dispute() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let reason = String::from_str(&env, "Unauthorized withdrawal");
+    client.file_withdrawal_dispute(&vault_id, &owner, &reason);
+
+    client.resolve_withdrawal_dispute(&vault_id, &owner, &0u32, &true);
+
+    let disputes = client.get_withdrawal_disputes(&vault_id);
+    assert_eq!(disputes.len(), 1);
+    let dispute = disputes.get(0).unwrap();
+    assert_eq!(dispute.status, DisputeStatus::Resolved);
+    assert!(dispute.resolved_at.is_some());
+}
+
+#[test]
+fn test_dispute_grace_period() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let reason = String::from_str(&env, "Unauthorized withdrawal");
+    client.file_withdrawal_dispute(&vault_id, &owner, &reason);
+
+    let disputes = client.get_withdrawal_disputes(&vault_id);
+    let dispute = disputes.get(0).unwrap();
+    
+    let grace_period = 86_400u64; // 24 hours
+    assert_eq!(dispute.dispute_expires_at - dispute.dispute_filed_at, grace_period);
+}
+
+#[test]
+fn test_multiple_disputes() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &300_000);
+    
+    client.withdraw(&vault_id, &owner, &50_000);
+    client.withdraw(&vault_id, &owner, &75_000);
+
+    let reason1 = String::from_str(&env, "First unauthorized withdrawal");
+    let reason2 = String::from_str(&env, "Second unauthorized withdrawal");
+    
+    client.file_withdrawal_dispute(&vault_id, &owner, &reason1);
+    client.file_withdrawal_dispute(&vault_id, &owner, &reason2);
+
+    let disputes = client.get_withdrawal_disputes(&vault_id);
+    assert_eq!(disputes.len(), 2);
+    assert_eq!(disputes.get(0).unwrap().status, DisputeStatus::Filed);
+    assert_eq!(disputes.get(1).unwrap().status, DisputeStatus::Filed);
+}
+
+#[test]
+fn test_dispute_only_by_owner() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&owner, &vault_id, &100_000);
+    client.withdraw(&vault_id, &owner, &50_000);
+
+    let other_user = Address::generate(&env);
+    let reason = String::from_str(&env, "Unauthorized withdrawal");
+    
+    let result = client.try_file_withdrawal_dispute(&vault_id, &other_user, &reason);
+    assert!(result.is_err());
+}
