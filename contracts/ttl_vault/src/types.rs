@@ -114,6 +114,12 @@ pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
 pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
 pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
 pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
+pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
+pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
+pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
+pub const TOKEN_UNSTAKING_TOPIC: Symbol = symbol_short!("tok_ust");
+pub const YIELD_DISTRIBUTED_TOPIC: Symbol = symbol_short!("yld_dst");
+pub const YIELD_REINVESTED_TOPIC: Symbol = symbol_short!("yld_rin");
 // Wrapped token registration for cross-chain compatibility
 pub const WRAPPED_TOKEN_REGISTERED_TOPIC: Symbol = symbol_short!("wrp_reg");
 pub const WRAPPED_TOKEN_UNREGISTERED_TOPIC: Symbol = symbol_short!("wrp_unr");
@@ -541,6 +547,24 @@ pub struct TokenStaking {
     pub staking_start: u64,
     pub annual_yield_bps: u32,
     pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDistributionMode {
+    DistributeToBeneficiary,
+    Reinvest,
+    Split(u32),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistributionConfig {
+    pub vault_id: u64,
+    pub mode: YieldDistributionMode,
+    pub last_distribution: u64,
+    pub total_distributed: i128,
+    pub total_reinvested: i128,
 }
 
 /// Passkey hash for multi-passkey support - Issue #394

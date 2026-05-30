@@ -14,7 +14,7 @@ use types::{
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, PendingBeneficiaryUpdate, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
-    TokenConversion, TokenStaking,
+    TokenConversion, TokenStaking, YieldDistributionMode, YieldDistributionConfig,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     TtlBorrowRecord, BeneficiaryCommitment,
     GeoCheckInEntry,
