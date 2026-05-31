@@ -73,12 +73,12 @@ use types::{
     TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
     TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
     TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
-    RoundingMode, ROUNDING_MODE_TOPIC,
+    BeneficiaryPool, POOL_CREATED_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
-mod beneficiary_rounding_tests;
+mod beneficiary_pooling_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -211,6 +211,10 @@ pub enum ContractError {
     // Issue #546: vesting bonus
     BonusNotEnabled = 73,
     TokenNotWhitelisted = 74,
+    // Issue #526: post-release clawback
+    NotReleased = 75,
+    GracePeriodExpired = 76,
+    NothingToClawback = 77,
 }
 
 #[contract]
@@ -10525,26 +10529,26 @@ impl TtlVaultContract {
         env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
     }
 
-    // ── Issue #524: configurable BPS rounding rules ───────────────────────
-
-    /// Sets the rounding mode used when computing per-beneficiary share amounts - Issue #524.
+    /// Creates a beneficiary pool from registered vault beneficiaries - Issue #529.
     ///
-    /// Rounding is applied **only at distribution time**; BPS storage is never mutated,
-    /// so there is zero migration risk and total BPS remains 10 000.
+    /// Validates that all `members` appear in the vault's beneficiary list, sums their
+    /// individual BPS allocations into `pooledAllocation[pool_id]`, and persists the pool.
     ///
-    /// | Mode  | Formula                                  |
-    /// |-------|------------------------------------------|
-    /// | Floor | `value / divisor`  (default)             |
-    /// | Ceil  | `(value + divisor - 1) / divisor`        |
-    /// | Round | `(value + divisor / 2) / divisor`        |
+    /// # Arguments
+    /// * `vault_id` - The vault whose beneficiary list is used for validation
+    /// * `caller`   - Must be the vault owner
+    /// * `pool_id`  - Unique pool identifier chosen by the caller
+    /// * `members`  - Addresses that must each be registered beneficiaries of the vault
     ///
     /// # Errors
-    /// * `ContractError::NotOwner` - caller is not the vault owner
-    pub fn set_rounding_mode(
+    /// * `ContractError::NotOwner`         - caller is not the vault owner
+    /// * `ContractError::InvalidBeneficiary` - a member is not in the vault's beneficiary list
+    pub fn create_pool(
         env: Env,
         vault_id: u64,
         caller: Address,
-        mode: RoundingMode,
+        pool_id: u64,
+        members: Vec<Address>,
     ) -> Result<(), ContractError> {
         caller.require_auth();
         Self::assert_not_paused(&env);
@@ -10552,32 +10556,40 @@ impl TtlVaultContract {
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
-        let key = DataKey::VaultRoundingMode(vault_id);
-        env.storage().persistent().set(&key, &mode);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+
+        let mut total_bps: u32 = 0;
+        for member in members.iter() {
+            let mut found = false;
+            for entry in vault.beneficiaries.iter() {
+                if entry.address == member {
+                    total_bps = total_bps.saturating_add(entry.bps);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(ContractError::InvalidBeneficiary);
+            }
+        }
+
+        let pool = BeneficiaryPool {
+            pool_id,
+            members: members.clone(),
+            total_bps,
+        };
+        env.storage().persistent().set(&DataKey::BeneficiaryPool(pool_id), &pool);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryPool(pool_id),
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ROUNDING_MODE_TOPIC, vault_id), mode as u32);
+        env.events().publish((POOL_CREATED_TOPIC, pool_id), (members, total_bps));
         Ok(())
     }
 
-    /// Returns the active rounding mode for `vault_id` (defaults to `RoundingMode::Floor`).
-    pub fn get_rounding_mode(env: Env, vault_id: u64) -> RoundingMode {
-        env.storage()
-            .persistent()
-            .get(&DataKey::VaultRoundingMode(vault_id))
-            .unwrap_or(RoundingMode::Floor)
-    }
-
-    /// Applies the vault's configured rounding mode to `value / divisor`.
-    ///
-    /// This is a **pure computation helper** — call it during any distribution pass to
-    /// avoid sub-stroop dust without altering stored BPS.
-    pub fn apply_rounding(env: Env, vault_id: u64, value: i128, divisor: i128) -> i128 {
-        let mode = Self::get_rounding_mode(env, vault_id);
-        match mode {
-            RoundingMode::Ceil  => (value + divisor - 1) / divisor,
-            RoundingMode::Round => (value + divisor / 2) / divisor,
-            RoundingMode::Floor => value / divisor,
-        }
+    /// Returns the pool record for `pool_id`, if it exists.
+    pub fn get_pool(env: Env, pool_id: u64) -> Option<BeneficiaryPool> {
+        env.storage().persistent().get(&DataKey::BeneficiaryPool(pool_id))
     }
 }

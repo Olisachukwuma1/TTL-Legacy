@@ -206,18 +206,8 @@ pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
 pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
 pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
 
-// Issue #524: configurable BPS rounding mode
-pub const ROUNDING_MODE_TOPIC: Symbol = symbol_short!("rnd_mode");
-
-/// Rounding strategy applied at distribution time to prevent sub-stroop dust - Issue #524.
-/// BPS storage is never mutated; rounding is applied only when computing share amounts.
-#[contracttype]
-#[derive(Clone, Copy, PartialEq)]
-pub enum RoundingMode {
-    Floor = 0,
-    Ceil  = 1,
-    Round = 2,
-}
+// Issue #529: beneficiary pooling
+pub const POOL_CREATED_TOPIC: Symbol = symbol_short!("pool_crt");
 
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
@@ -419,8 +409,9 @@ pub enum DataKey {
     TokenHedge(u64),
     // Issue #588: token rebalancing
     TokenRebalance(u64),
-    // Issue #524: vault-level rounding mode
-    VaultRoundingMode(u64),
+    // Issue #529: beneficiary pooling
+    BeneficiaryPool(u64),
+    BeneficiaryPoolAlloc(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1293,4 +1284,13 @@ pub struct TokenRebalanceConfig {
     /// Drift threshold in basis points that triggers a rebalance (e.g., 500 = 5%).
     pub rebalance_threshold_bps: u32,
     pub total_rebalances: u32,
+}
+
+/// A pool of beneficiaries whose BPS allocations are combined - Issue #529.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryPool {
+    pub pool_id: u64,
+    pub members: Vec<Address>,
+    pub total_bps: u32,
 }
